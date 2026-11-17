@@ -341,3 +341,138 @@ def test_retry_state_persisted_not_in_memory(client):
         assert row["max_retries"] >= 1
         assert row["retries"] <= row["max_retries"]
         assert row["state"] in (qr.COOLING, qr.READY, qr.DEAD, qr.RELEASED)
+
+
+# —— 冷却证明实体（基线所无） ——
+
+def test_cooldown_proof_written_on_register_and_readonly_query(client):
+    """隔离登记即落证明：间隔、是否放行、是否死信可按键只读查。"""
+    _settle()
+    item = _item_by_key("REV-20261116-004")
+    proofs = _C.get(f"/api/quarantine/{item['id']}/cooldown-proofs")
+    assert proofs.status_code == 200, proofs.text
+    rows = proofs.json()
+    assert rows, "登记时就必须有冷却证明"
+    latest = rows[0]
+    assert latest["item_id"] == item["id"]
+    assert latest["entry_key"] == "REV-20261116-004"
+    assert latest["cooldown_interval_seconds"] == 60
+    assert latest["remaining_seconds"] > 0
+    assert latest["cooldown_active"] == 1
+    assert latest["allowed"] == 0, "未满冷却不得放行"
+    assert latest["dead_letter"] == 0
+    assert latest["state"] == qr.COOLING
+    assert latest["source"] == "隔离登记"
+
+    # 列表里的证明字段与只读证明同源（同一 id、同一间隔、同一放行结论）
+    row = _item_by_key("REV-20261116-004")
+    assert row["cooldown_interval_seconds"] == latest["cooldown_interval_seconds"]
+    assert row["cooldown_proof"]["proof_id"] == latest["id"]
+    assert row["cooldown_proof"]["allowed"] == latest["allowed"]
+    assert row["cooldown_proof"]["dead_letter"] == latest["dead_letter"]
+
+    # 只读：查询不改变隔离态与余额
+    before = _balance(item["account_id"])
+    _C.get(f"/api/quarantine/{item['id']}/cooldown-proofs")
+    assert _balance(item["account_id"]) == before
+    assert _item_by_key("REV-20261116-004")["retries"] == 0
+
+
+def test_rejected_cooldown_records_proof_and_changes_nothing(client):
+    """未满冷却再配被拒：留一条不放行证明，次数/余额/next_at 均不动。"""
+    _settle()
+    item = _item_by_key("REV-20261116-004")
+    before_balance = _balance(item["account_id"])
+    before = {
+        "retries": item["retries"],
+        "next_at": item["next_at"],
+        "state": item["state"],
+    }
+
+    r = _C.post(f"/api/quarantine/{item['id']}/retry")
+    assert r.status_code == 409
+    assert "冷却" in r.json()["detail"]
+
+    after = _item_by_key("REV-20261116-004")
+    assert after["retries"] == before["retries"]
+    assert after["next_at"] == before["next_at"]
+    assert after["state"] == before["state"]
+    assert _balance(item["account_id"]) == before_balance
+
+    proofs = _C.get(f"/api/quarantine/{item['id']}/cooldown-proofs").json()
+    latest = proofs[0]
+    assert latest["allowed"] == 0
+    assert latest["source"] == "手动入口·拒绝"
+    assert latest["remaining_seconds"] > 0
+    assert latest["dead_letter"] == 0
+
+
+def test_failure_persists_interval_next_at_and_advances_dead_letter(client):
+    """失败按 base*factor^(n-1) 落间隔与 next_at；到上限转死信并停配平。"""
+    item_id = _make_quarantined_reversal("REV-PROOF-DEAD", 3, 900, "FWD-NEVER-2")
+    max_retries = next(x for x in _items() if x["id"] == item_id)["max_retries"]
+
+    expected_intervals = [60, 120, 240]
+    for n in range(1, max_retries + 1):
+        _rewind_cooldown(item_id)
+        r = _C.post(f"/api/quarantine/{item_id}/retry")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["retries"] == n
+        assert body["outcome"] == "失败"
+        if n < max_retries:
+            assert body["state"] == qr.COOLING
+            assert body["cooldown_interval_seconds"] == expected_intervals[n - 1]
+            assert body["next_at"] is not None
+        else:
+            assert body["state"] == qr.DEAD
+            assert body["dead_letter"] is True
+            assert body["next_at"] is None
+            assert body["cooldown_interval_seconds"] == expected_intervals[n - 1]
+
+    # 次数、上次尝试时刻、证明齐落库（新连接读得到）
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT retries, state, next_at, last_attempt_at, cooldown_interval_seconds "
+            "FROM quarantine_retry_state WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+    assert row["retries"] == max_retries
+    assert row["state"] == qr.DEAD
+    assert row["next_at"] is None
+    assert row["last_attempt_at"]
+
+    proofs = _C.get(f"/api/quarantine/{item_id}/cooldown-proofs").json()
+    assert proofs[0]["dead_letter"] == 1
+    assert proofs[0]["state"] == qr.DEAD
+    assert {p["cooldown_interval_seconds"] for p in proofs if p["source"].endswith("失败")} == {
+        expected_intervals[i] for i in range(max_retries)
+    }
+
+    # 死信停在可查态，不能进配平：自动扫描、手动都拒
+    _rewind_cooldown(item_id)
+    auto = _C.post("/api/quarantine/retry-due").json()
+    assert all(x.get("item_id") != item_id for x in auto["results"])
+    manual = _C.post(f"/api/quarantine/{item_id}/retry")
+    assert manual.status_code == 409
+    assert "死信" in manual.json()["detail"]
+    assert next(x for x in _items() if x["id"] == item_id)["retries"] == max_retries
+
+    # 死信可单独查，敞口仍计入报告
+    assert any(x["id"] == item_id for x in _items(state="死信"))
+    report = _C.get("/api/quarantine/retry-report").json()
+    assert report["dead_letter_count"] >= 1
+    assert report["dead_letter_exposure_cents"] >= 900
+
+
+def test_output_fields_carry_cooldown_interval_from_extension_table(client):
+    """列表/报告不靠内存计数：间隔取扩展表，重试后与库内一致。"""
+    _settle()
+    item = _item_by_key("REV-20261116-004")
+    assert item["cooldown_interval_seconds"] == qr.cooldown_base_seconds()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT cooldown_interval_seconds FROM quarantine_retry_state WHERE item_id = ?",
+            (item["id"],),
+        ).fetchone()
+    assert row["cooldown_interval_seconds"] == item["cooldown_interval_seconds"]

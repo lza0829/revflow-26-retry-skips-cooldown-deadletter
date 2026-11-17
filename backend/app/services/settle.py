@@ -32,8 +32,10 @@ def _quarantine(
         """,
         (entry_key, account_id, reason, amount_cents, settle_run_id, created_at),
     )
-    pass
-    return cur.lastrowid
+    item_id = cur.lastrowid
+    # 隔离行与重试进度（计数/冷却/证明）同一事务登记，从落库起就可查。
+    quarantine_retry.register_item(conn, item_id, created_at)
+    return item_id
 
 
 def dashboard() -> dict:

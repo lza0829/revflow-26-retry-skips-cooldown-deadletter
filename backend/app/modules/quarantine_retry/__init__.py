@@ -2,11 +2,14 @@
 
 设计要点（对应隔离重试策略，不是放行冻结窗 / SLA 游标）：
 
-* 重试进度落在扩展表 ``quarantine_retry_state``（retries / next_at / max_retries），
-  不在调度内存里数次数；
+* 重试进度只落在扩展表 ``quarantine_retry_state``（retries / max_retries / next_at /
+  cooldown_interval_seconds / last_attempt_at），隔离行本身不另存一份计数，也不在调度内存里数次数；
+* 重试入口先过闸门：未到 ``next_at``（冷却中）或已达死信上限直接 409 拒绝，
+  拒绝路径不改余额、不推进次数；
 * 每次真正尝试都在 ``BEGIN IMMEDIATE`` 事务内完成：成功 = 计数 +1、改余额、离开隔离；
-  失败 = 计数 +1、写新 next_at、余额不动；
-* 失败次数达到上限进入 ``死信``，自动与手动重试均被拒绝；
+  失败 = 计数 +1、按 ``base * factor^(n-1)`` 写新 next_at、余额不动；达到上限转 ``死信``；
+* 每次闸门评估（登记、尝试、拒绝）都落一条冷却证明 ``quarantine_cooldown_proofs``
+  （隔离键、间隔、是否放行、是否死信），与扩展表同一事务写入，可按隔离 id 只读查询；
 * 重试明细另落 ``quarantine_retry_attempts``，报告与隔离态、余额同源读取。
 """
 
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS quarantine_retry_state (
   retries INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 3,
   next_at TEXT,
+  cooldown_interval_seconds INTEGER NOT NULL DEFAULT 0,
   state TEXT NOT NULL DEFAULT '冷却中',
   last_attempt_at TEXT,
   last_outcome TEXT NOT NULL DEFAULT '',
@@ -66,11 +70,42 @@ CREATE TABLE IF NOT EXISTS quarantine_retry_attempts (
   state_after TEXT NOT NULL,
   attempted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quarantine_cooldown_proofs (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES quarantine_items(id) ON DELETE CASCADE,
+  entry_key TEXT NOT NULL,
+  retries INTEGER NOT NULL,
+  max_retries INTEGER NOT NULL,
+  cooldown_interval_seconds INTEGER NOT NULL DEFAULT 0,
+  next_at TEXT,
+  remaining_seconds INTEGER NOT NULL DEFAULT 0,
+  cooldown_active INTEGER NOT NULL DEFAULT 0,
+  allowed INTEGER NOT NULL DEFAULT 0,
+  dead_letter INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  source TEXT NOT NULL,
+  evaluated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_quarantine_retry_attempts_item
   ON quarantine_retry_attempts(item_id, id);
 CREATE INDEX IF NOT EXISTS idx_quarantine_retry_state_due
   ON quarantine_retry_state(state, next_at);
+CREATE INDEX IF NOT EXISTS idx_quarantine_cooldown_proofs_item
+  ON quarantine_cooldown_proofs(item_id, id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """补偿旧库缺列：扩展表加冷却间隔列（幂等）。"""
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(quarantine_retry_state)").fetchall()
+    }
+    if "cooldown_interval_seconds" not in cols:
+        conn.execute(
+            "ALTER TABLE quarantine_retry_state "
+            "ADD COLUMN cooldown_interval_seconds INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 # —— 时间与配置 ——
@@ -146,6 +181,7 @@ def backoff_seconds(retries_after: int) -> int:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
 
 
 def _insert_state(
@@ -154,18 +190,38 @@ def _insert_state(
     created_at: str,
     now: str,
 ) -> None:
-    next_at = add_seconds(created_at, cooldown_base_seconds())
+    interval = cooldown_base_seconds()
+    next_at = add_seconds(created_at, interval)
     next_dt = parse_time(next_at)
     now_dt = parse_time(now) or utcnow()
     state = READY if next_dt is None or next_dt <= now_dt else COOLING
-    conn.execute(
+    inserted = conn.execute(
         """
         INSERT OR IGNORE INTO quarantine_retry_state(
-          item_id, retries, max_retries, next_at, state,
-          created_at, updated_at
-        ) VALUES (?, 0, ?, ?, ?, ?, ?)
+          item_id, retries, max_retries, next_at, cooldown_interval_seconds,
+          state, created_at, updated_at
+        ) VALUES (?, 0, ?, ?, ?, ?, ?, ?)
         """,
-        (item_id, default_max_retries(), next_at, state, created_at, now),
+        (item_id, default_max_retries(), next_at, interval, state, created_at, now),
+    ).rowcount
+    if not inserted:
+        return
+    entry = conn.execute(
+        "SELECT entry_key FROM quarantine_items WHERE id = ?", (item_id,)
+    ).fetchone()
+    allowed, _ = gate(0, default_max_retries(), state, next_at, now_dt)
+    _record_proof(
+        conn,
+        item_id=item_id,
+        entry_key=entry["entry_key"] if entry else "",
+        retries=0,
+        max_retries=default_max_retries(),
+        cooldown_interval_seconds=interval,
+        next_at=next_at,
+        state=state,
+        allowed=allowed,
+        now=now_dt,
+        source="隔离登记",
     )
 
 
@@ -193,7 +249,49 @@ def backfill_state(conn: sqlite3.Connection, now: str | None = None) -> int:
     ).fetchall()
     for row in rows:
         _insert_state(conn, row["id"], row["created_at"], now)
+    _normalize_dead_letter(conn, now)
     return len(rows)
+
+
+def _normalize_dead_letter(conn: sqlite3.Connection, now: str) -> int:
+    """次数已达上限却未标死信的存量行，收敛为死信（停配平、可查）。"""
+    rows = conn.execute(
+        """
+        SELECT s.item_id, s.retries, s.max_retries, s.next_at, s.cooldown_interval_seconds,
+               q.entry_key
+        FROM quarantine_retry_state s
+        JOIN quarantine_items q ON q.id = s.item_id
+        WHERE s.state IN (?, ?) AND s.retries >= s.max_retries
+        """,
+        (COOLING, READY),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        updated = conn.execute(
+            """
+            UPDATE quarantine_retry_state
+            SET state = ?, next_at = NULL, updated_at = ?
+            WHERE item_id = ? AND state IN (?, ?) AND retries >= max_retries
+            """,
+            (DEAD, now, row["item_id"], COOLING, READY),
+        ).rowcount
+        if not updated:
+            continue
+        changed += 1
+        _record_proof(
+            conn,
+            item_id=row["item_id"],
+            entry_key=row["entry_key"],
+            retries=row["retries"],
+            max_retries=row["max_retries"],
+            cooldown_interval_seconds=row["cooldown_interval_seconds"],
+            next_at=None,
+            state=DEAD,
+            allowed=False,
+            now=parse_time(now) or utcnow(),
+            source="死信收敛",
+        )
+    return changed
 
 
 # —— 状态与闸门 ——
@@ -220,10 +318,23 @@ def gate(
     next_at: str | None,
     now: datetime,
 ) -> tuple[bool, str]:
-    """返回 (是否允许重试, 拒绝原因)。"""
-    state = effective_state(stored_state, next_at, now)
-    if state == RELEASED:
+    """再配入口闸门：返回 (是否放行, 拒绝原因)。
+
+    放行条件同时满足：未解除、未达次数上限、冷却已到期。
+    未到点或已死信一律拒绝，不推进次数、不改余额。
+    """
+    if stored_state == RELEASED:
         return False, "该隔离项已解除（重试已配平离开隔离）"
+    if stored_state == DEAD or retries >= max_retries:
+        return False, (
+            f"该隔离项已进入死信（{retries}/{max_retries} 次），"
+            "按策略不再重试"
+        )
+    state = effective_state(stored_state, next_at, now)
+    if state == COOLING:
+        remain = cooldown_remaining_seconds(next_at, now)
+        if remain > 0:
+            return False, f"冷却未满，剩余 {remain} 秒（下次可重试 {next_at}）"
     return True, ""
 
 
@@ -231,6 +342,48 @@ def _state_row(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM quarantine_retry_state WHERE item_id = ?", (item_id,)
     ).fetchone()
+
+
+def _record_proof(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    entry_key: str,
+    retries: int,
+    max_retries: int,
+    cooldown_interval_seconds: int,
+    next_at: str | None,
+    state: str,
+    allowed: bool,
+    now: datetime,
+    source: str,
+) -> None:
+    """落一条冷却证明：与扩展表同一事务写，禁止只靠内存计数。"""
+    remain = cooldown_remaining_seconds(next_at, now)
+    conn.execute(
+        """
+        INSERT INTO quarantine_cooldown_proofs(
+          item_id, entry_key, retries, max_retries,
+          cooldown_interval_seconds, next_at, remaining_seconds,
+          cooldown_active, allowed, dead_letter, state, source, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item_id,
+            entry_key,
+            retries,
+            max_retries,
+            cooldown_interval_seconds,
+            next_at,
+            remain,
+            1 if remain > 0 and state == COOLING else 0,
+            1 if allowed else 0,
+            1 if state == DEAD or retries >= max_retries else 0,
+            state,
+            source,
+            fmt_time(now),
+        ),
+    )
 
 
 # —— 查询 ——
@@ -248,6 +401,20 @@ def _decorate(row: sqlite3.Row, now: datetime) -> dict[str, Any]:
     item["cooldown_seconds_remaining"] = remain
     item["can_retry"] = allowed
     item["block_reason"] = block_reason
+    # 冷却证明取自最新一条已落库证明（与扩展表同一事务写入），字段不做实时重算；
+    # 实时放行结论另在 can_retry / block_reason 上给，避免把新结论挂到旧证明 id。
+    proof_id = item.pop("proof_id", None)
+    item["cooldown_proof"] = {
+        "proof_id": proof_id,
+        "cooldown_interval_seconds": item.pop(
+            "proof_interval", item.get("cooldown_interval_seconds", 0)
+        ),
+        "remaining_seconds": item.pop("proof_remaining", remain),
+        "allowed": item.pop("proof_allowed", 1 if allowed else 0),
+        "dead_letter": item.pop("proof_dead", 1 if item["dead_letter"] else 0),
+        "source": item.pop("proof_source", ""),
+        "evaluated_at": item.pop("proof_at", None),
+    }
     return item
 
 
@@ -267,11 +434,20 @@ def list_items(
                    q.settle_run_id, q.created_at,
                    a.code AS account_code,
                    s.retries, s.max_retries, s.next_at, s.state AS retry_state,
+                   s.cooldown_interval_seconds,
                    s.last_attempt_at, s.last_outcome, s.last_reason,
-                   s.released_at, s.balance_delta_cents
+                   s.released_at, s.balance_delta_cents,
+                   p.id AS proof_id, p.cooldown_interval_seconds AS proof_interval,
+                   p.remaining_seconds AS proof_remaining,
+                   p.allowed AS proof_allowed, p.dead_letter AS proof_dead,
+                   p.source AS proof_source, p.evaluated_at AS proof_at
             FROM quarantine_items q
             JOIN accounts a ON a.id = q.account_id
             JOIN quarantine_retry_state s ON s.item_id = q.id
+            LEFT JOIN quarantine_cooldown_proofs p ON p.id = (
+              SELECT MAX(p2.id) FROM quarantine_cooldown_proofs p2
+              WHERE p2.item_id = q.id
+            )
             ORDER BY q.id DESC
             """
         ).fetchall()
@@ -282,6 +458,27 @@ def list_items(
     elif not include_released:
         items = [x for x in items if x["state"] != RELEASED]
     return items
+
+
+def list_proofs(item_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+    """按隔离 id 只读查询冷却证明（隔离键、间隔、是否放行、是否死信）。"""
+    with connect() as conn:
+        item = conn.execute(
+            "SELECT id FROM quarantine_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if item is None:
+            raise HTTPException(404, "隔离项不存在")
+        return rows_to_dicts(
+            conn.execute(
+                """
+                SELECT * FROM quarantine_cooldown_proofs
+                WHERE item_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (item_id, limit),
+            ).fetchall()
+        )
 
 
 # —— 报告（与隔离态、余额同源读取） ——
@@ -458,6 +655,7 @@ def _perform_attempt(
     retries_before = state["retries"]
     max_retries = state["max_retries"]
     new_retries = retries_before + 1
+    interval = backoff_seconds(new_retries)
 
     reversal = conn.execute(
         "SELECT * FROM ledger_entries WHERE entry_key = ?", (item["entry_key"],)
@@ -505,7 +703,8 @@ def _perform_attempt(
         advanced = conn.execute(
             """
             UPDATE quarantine_retry_state
-            SET retries = ?, next_at = NULL, state = ?, last_attempt_at = ?,
+            SET retries = ?, next_at = NULL, cooldown_interval_seconds = 0,
+                state = ?, last_attempt_at = ?,
                 last_outcome = ?, last_reason = '', released_at = ?,
                 balance_delta_cents = ?, updated_at = ?
             WHERE item_id = ? AND retries = ? AND state NOT IN (?, ?)
@@ -527,6 +726,7 @@ def _perform_attempt(
         if advanced != 1:
             # 同一事务内计数必须恰好推进一次，否则整体回滚（余额也不会变）。
             raise RuntimeError("重试计数未按预期推进，已回滚")
+        # 成功：冷却间隔清零，次状态转已解除；同一事务写明细与证明。
         conn.execute(
             """
             INSERT INTO quarantine_retry_attempts(
@@ -546,6 +746,19 @@ def _perform_attempt(
                 RELEASED,
                 now_s,
             ),
+        )
+        _record_proof(
+            conn,
+            item_id=item["id"],
+            entry_key=item["entry_key"],
+            retries=new_retries,
+            max_retries=max_retries,
+            cooldown_interval_seconds=0,
+            next_at=None,
+            state=RELEASED,
+            allowed=True,
+            now=now,
+            source=f"{trigger}尝试·{OUTCOME_SUCCESS}",
         )
         balance = conn.execute(
             "SELECT balance_cents FROM accounts WHERE id = ?",
@@ -569,19 +782,21 @@ def _perform_attempt(
             "trigger": trigger,
         }
 
-    # 失败：只推进重试进度，余额不动。
-    next_at = None
-    new_state = READY
+    # 失败：按 cool-down 公式写新 next_at；次数到上限则转死信（不再进配平）。余额不动。
+    dead = new_retries >= max_retries
+    new_state = DEAD if dead else COOLING
+    next_at = None if dead else add_seconds(now, interval)
     advanced = conn.execute(
         """
         UPDATE quarantine_retry_state
-        SET retries = ?, next_at = ?, state = ?, last_attempt_at = ?,
-            last_outcome = ?, last_reason = ?, updated_at = ?
+        SET retries = ?, next_at = ?, cooldown_interval_seconds = ?, state = ?,
+            last_attempt_at = ?, last_outcome = ?, last_reason = ?, updated_at = ?
         WHERE item_id = ? AND retries = ? AND state NOT IN (?, ?)
         """,
         (
             new_retries,
             next_at,
+            interval,
             new_state,
             now_s,
             OUTCOME_FAILURE,
@@ -617,6 +832,19 @@ def _perform_attempt(
             now_s,
         ),
     )
+    _record_proof(
+        conn,
+        item_id=item["id"],
+        entry_key=item["entry_key"],
+        retries=new_retries,
+        max_retries=max_retries,
+        cooldown_interval_seconds=interval,
+        next_at=next_at,
+        state=new_state,
+        allowed=True,
+        now=now,
+        source=f"{trigger}尝试·{OUTCOME_FAILURE}",
+    )
     return {
         "ok": False,
         "rejected": False,
@@ -627,8 +855,9 @@ def _perform_attempt(
         "retries": new_retries,
         "max_retries": max_retries,
         "state": new_state,
-        "dead_letter": new_state == DEAD,
+        "dead_letter": dead,
         "next_at": next_at,
+        "cooldown_interval_seconds": interval,
         "cooldown_seconds_remaining": cooldown_remaining_seconds(next_at, now),
         "balance_delta_cents": 0,
         "trigger": trigger,
@@ -666,6 +895,21 @@ def retry_item(
             now,
         )
         if not allowed:
+            # 拒绝也留证：不改余额、不推进次数；证明与扩展表同一事务提交。
+            _record_proof(
+                conn,
+                item_id=item["id"],
+                entry_key=item["entry_key"],
+                retries=state["retries"],
+                max_retries=state["max_retries"],
+                cooldown_interval_seconds=state["cooldown_interval_seconds"],
+                next_at=state["next_at"],
+                state=effective_state(state["state"], state["next_at"], now),
+                allowed=False,
+                now=now,
+                source=f"{trigger}入口·拒绝",
+            )
+            conn.execute("COMMIT")
             raise HTTPException(409, f"拒绝重试：{reason}")
         result = _perform_attempt(conn, item, state, now, trigger)
         conn.execute("COMMIT")
@@ -685,7 +929,7 @@ def retry_due(
     limit: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """自动扫描到期项：只碰冷却结束且未达上限的隔离项。"""
+    """自动扫描到期项：只碰冷却结束且未达上限的隔离项；死信不进配平。"""
     now = now or utcnow()
     now_s = fmt_time(now)
     with connect() as conn:
@@ -694,10 +938,12 @@ def retry_due(
             """
             SELECT s.item_id
             FROM quarantine_retry_state s
-            WHERE s.state IN (?, ?, ?)
+            WHERE s.state IN (?, ?)
+              AND s.retries < s.max_retries
+              AND (s.next_at IS NULL OR s.next_at <= ?)
             ORDER BY COALESCE(s.next_at, '') ASC, s.item_id ASC
             """,
-            (COOLING, READY, DEAD),
+            (COOLING, READY, now_s),
         ).fetchall()
     item_ids = [r["item_id"] for r in rows]
     if limit:

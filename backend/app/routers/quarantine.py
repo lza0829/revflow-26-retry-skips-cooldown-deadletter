@@ -28,6 +28,12 @@ def get_attempts(item_id: int):
     return quarantine_retry.list_attempts(item_id)
 
 
+@router.get("/quarantine/{item_id}/cooldown-proofs")
+def get_cooldown_proofs(item_id: int, limit: int = Query(50, ge=1, le=200)):
+    """冷却证明（只读）：隔离键、间隔、是否放行、是否死信。"""
+    return quarantine_retry.list_proofs(item_id, limit=limit)
+
+
 @router.post("/quarantine/{item_id}/retry")
 def post_retry(item_id: int):
     try:

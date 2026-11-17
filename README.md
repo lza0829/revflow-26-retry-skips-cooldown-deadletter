@@ -39,21 +39,47 @@ npm run dev
 | 已重试次数 `retries` | `quarantine_retry_state` | 扩展表，不复用隔离行；调度内存不计数 |
 | 次数上限 `max_retries` | 同上 | 默认 3，`QUARANTINE_RETRY_MAX` 可调 |
 | 下次可重试 `next_at` | 同上 | 首次失败后 `base * factor^(n-1)`，封顶 `QUARANTINE_RETRY_COOLDOWN_MAX_SECONDS` |
+| 冷却间隔 `cooldown_interval_seconds` | 同上 | 与 `next_at` 同一次写入；进度只此一处，隔离行不另存计数 |
 | 状态 | 同上 | `冷却中` / `可重试` / `死信` / `已解除` |
 | 每次尝试明细 | `quarantine_retry_attempts` | 触发方式、结果、原因、余额变动、次数与 next_at |
+| 冷却证明 | `quarantine_cooldown_proofs` | 隔离键、间隔、剩余秒数、是否放行、是否死信、来源、评估时刻 |
 
-* 重试前闸门同时校验冷却结束与次数未超上限；不满足返回 409 并写明原因（冷却剩余秒数 / 死信）。
-* 一次尝试在 `BEGIN IMMEDIATE` 事务内完成：成功 = 次数 +1、补记原单与冲正为已归并、改余额、状态转 `已解除`；
-  失败 = 次数 +1、写新 `next_at`、余额不动。计数推进不是 1 行即整体回滚，杜绝「次数没加但余额已变」。
-* 达到上限进入 `死信`，自动扫描与手动重试都拒绝；可用 `GET /api/quarantine?state=死信` 单独查询。
+### 门禁路径（本仓择一，写明）
+
+采用 **「再配入口未到点 / 已死信直接拒绝，不改余额」**：
+
+* 手动 `POST /api/quarantine/{id}/retry` 与自动 `POST /api/quarantine/retry-due` 共用同一闸门：
+  冷却未满（`next_at` 未到）或已达死信上限，**在进入结算之前**返回 409，次数、`next_at`、余额都不动；
+  拒绝本身也落一条 `allowed=0` 的冷却证明，可审计。
+* 自动扫描只取 `state ∈ {冷却中, 可重试}` 且 `retries < max_retries` 且已到点的行；
+  `死信` 行永远不进入配平，停在 `GET /api/quarantine?state=死信` 可查状态，敞口计入报告。
+* 真正进入结算的尝试在 `BEGIN IMMEDIATE` 内一次成功或整体回滚：
+  成功 = 次数 +1、补记原单与冲正为已归并、改余额、状态转 `已解除`；
+  失败 = 次数 +1、按 `base * factor^(n-1)` 写新 `next_at` 与冷却间隔、余额不动；
+  `retries` 达到 `max_retries` 的那次失败直接转 `死信`、`next_at` 置空。
+* 次数与上次重试时刻 `last_attempt_at` 持久在扩展表，进程重启后仍可查；调度内存不计数。
 * `GET /api/quarantine/retry-report` 与隔离列表、余额、互证报告同源读取：冷却中 / 可重试 / 死信 / 重试成功数与敞口。
 * 死信不回灌余额；成功解除的敞口随余额一起移动，互证仍应一致。
+
+### 冷却证明
+
+`quarantine_cooldown_proofs` 是基线所无的独立证明实体，与扩展表**同一事务**写入，
+不依赖任何内存状态。只读接口：
+
+```bash
+curl http://127.0.0.1:10700/api/quarantine/1/cooldown-proofs
+```
+
+隔离列表每行附 `cooldown_proof`（最新一条证明的 id、间隔、剩余、是否放行、是否死信）与
+`cooldown_interval_seconds`，与扩展表当前行同源；未平隔离界面在列表列与「明细」中展示证明链。
 
 ```bash
 # 自动扫描到期项（只碰冷却结束且未达上限的）
 curl -X POST http://127.0.0.1:10700/api/quarantine/retry-due
 # 手动重试单项（冷却中/死信返回 409）
 curl -X POST http://127.0.0.1:10700/api/quarantine/1/retry
+# 按隔离 id 只读查冷却证明
+curl http://127.0.0.1:10700/api/quarantine/1/cooldown-proofs
 ```
 
 ## 界面约定

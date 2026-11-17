@@ -5,6 +5,7 @@ import { getJson, postJson } from '../api'
 const rows = ref([])
 const report = ref(null)
 const attempts = ref({})
+const proofs = ref({})
 const openDetail = ref(null)
 const filter = ref('')
 const includeReleased = ref(false)
@@ -84,6 +85,16 @@ function cooldownText(row) {
   return `${sec} 秒`
 }
 
+function intervalText(row) {
+  const sec = Number(row.cooldown_interval_seconds || 0)
+  if (row.state === '已解除' || row.state === '死信') return '—'
+  return `${sec}s`
+}
+
+function yesNo(v) {
+  return v ? '是' : '否'
+}
+
 function stateTag(row) {
   if (row.state === '死信') return 'bad'
   if (row.state === '冷却中') return 'warn'
@@ -93,7 +104,10 @@ function stateTag(row) {
 
 async function refresh() {
   await load()
-  if (openDetail.value != null) await loadAttempts(openDetail.value)
+  if (openDetail.value != null) {
+    await loadAttempts(openDetail.value)
+    await loadProofs(openDetail.value)
+  }
 }
 
 async function retryOne(row) {
@@ -135,11 +149,20 @@ async function toggleDetail(row) {
   }
   openDetail.value = row.id
   await loadAttempts(row.id)
+  await loadProofs(row.id)
 }
 
 async function loadAttempts(id) {
   try {
     attempts.value = { ...attempts.value, [id]: await getJson(`/api/quarantine/${id}/attempts`) }
+  } catch (e) {
+    err.value = String(e.message || e)
+  }
+}
+
+async function loadProofs(id) {
+  try {
+    proofs.value = { ...proofs.value, [id]: await getJson(`/api/quarantine/${id}/cooldown-proofs`) }
   } catch (e) {
     err.value = String(e.message || e)
   }
@@ -153,7 +176,10 @@ function yuan(cents) {
 <template>
   <div>
     <h1>未平隔离</h1>
-    <p class="lead">冲正无原单、账户不一致或超额等未能配平的流水。隔离项可随时再试；次数与冷却仅作展示。</p>
+    <p class="lead">
+      冲正无原单、账户不一致或超额等未能配平的流水。再配入口先验冷却与死信：
+      未满冷却、已达死信上限一律拒绝且不动余额；次数、上次重试时刻与冷却证明均落库可查。
+    </p>
 
     <div class="stats">
       <div class="stat">
@@ -199,7 +225,8 @@ function yuan(cents) {
         <thead>
           <tr>
             <th>流水键</th><th>账户</th><th>原因</th><th>金额（元）</th>
-            <th>重试</th><th>状态</th><th>下次可重试</th><th>最近尝试</th><th>操作</th>
+            <th>重试</th><th>状态</th><th>冷却间隔</th><th>下次可重试</th>
+            <th>最近尝试</th><th>冷却证明</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -214,11 +241,24 @@ function yuan(cents) {
                 <span class="tag" :class="stateTag(q)">{{ q.state }}</span>
                 <span v-if="q.dead_letter" class="tag bad dl">死信</span>
               </td>
+              <td class="mono">{{ intervalText(q) }}</td>
               <td>{{ cooldownText(q) }}</td>
               <td>
                 <template v-if="q.last_attempt_at">
                   {{ q.last_attempt_at }}
                   <span class="tag" :class="q.last_outcome === '成功' ? 'on' : 'bad'">{{ q.last_outcome }}</span>
+                </template>
+                <template v-else>—</template>
+              </td>
+              <td class="proof-cell">
+                <template v-if="q.cooldown_proof && q.cooldown_proof.proof_id">
+                  <span class="tag" :class="q.cooldown_proof.allowed ? 'on' : 'warn'">
+                    {{ q.cooldown_proof.allowed ? '放行' : '不放行' }}
+                  </span>
+                  <span class="tag" :class="q.cooldown_proof.dead_letter ? 'bad' : ''">
+                    {{ q.cooldown_proof.dead_letter ? '死信' : '未死信' }}
+                  </span>
+                  <p class="proof-meta mono">#{{ q.cooldown_proof.proof_id }} · 余 {{ q.cooldown_proof.remaining_seconds }}s</p>
                 </template>
                 <template v-else>—</template>
               </td>
@@ -234,7 +274,7 @@ function yuan(cents) {
               </td>
             </tr>
             <tr v-if="openDetail === q.id" class="detail-row">
-              <td colspan="9">
+              <td colspan="11">
                 <p v-if="q.last_reason" class="detail-reason">最近失败原因：{{ q.last_reason }}</p>
                 <table class="inner">
                   <thead>
@@ -254,10 +294,33 @@ function yuan(cents) {
                     <tr v-if="!(attempts[q.id] || []).length"><td colspan="8">尚无重试记录</td></tr>
                   </tbody>
                 </table>
+
+                <p class="proof-title">冷却证明（只读，与扩展表同源）</p>
+                <table class="inner">
+                  <thead>
+                    <tr><th>#</th><th>隔离键</th><th>间隔（秒）</th><th>下次可重试</th><th>剩余（秒）</th><th>冷却有效</th><th>放行</th><th>死信</th><th>状态</th><th>来源</th><th>评估时刻</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="p in (proofs[q.id] || [])" :key="p.id">
+                      <td>{{ p.id }}</td>
+                      <td class="mono">{{ p.entry_key }}</td>
+                      <td class="mono">{{ p.cooldown_interval_seconds }}</td>
+                      <td>{{ p.next_at || '—' }}</td>
+                      <td class="mono">{{ p.remaining_seconds }}</td>
+                      <td>{{ yesNo(p.cooldown_active) }}</td>
+                      <td><span class="tag" :class="p.allowed ? 'on' : 'warn'">{{ yesNo(p.allowed) }}</span></td>
+                      <td><span class="tag" :class="p.dead_letter ? 'bad' : ''">{{ yesNo(p.dead_letter) }}</span></td>
+                      <td>{{ p.state }}</td>
+                      <td>{{ p.source }}</td>
+                      <td>{{ p.evaluated_at }}</td>
+                    </tr>
+                    <tr v-if="!(proofs[q.id] || []).length"><td colspan="11">尚无冷却证明</td></tr>
+                  </tbody>
+                </table>
               </td>
             </tr>
           </template>
-          <tr v-if="!shown.length"><td colspan="9">暂无隔离项（先跑归并）</td></tr>
+          <tr v-if="!shown.length"><td colspan="11">暂无隔离项（先跑归并）</td></tr>
         </tbody>
       </table>
     </div>
@@ -293,4 +356,7 @@ function yuan(cents) {
 .detail-row td { background: rgba(36, 87, 197, 0.03); }
 .detail-reason { margin: 0 0 10px; color: var(--warn); font-size: 12.5px; }
 .inner th, .inner td { padding: 7px 6px; font-size: 12.5px; }
+.proof-title { margin: 16px 0 8px; font-size: 12.5px; color: var(--muted); }
+.proof-cell { white-space: nowrap; }
+.proof-meta { margin: 4px 0 0; font-size: 11px; color: var(--muted); }
 </style>
